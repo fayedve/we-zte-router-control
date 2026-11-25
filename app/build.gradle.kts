@@ -11,13 +11,26 @@ android {
         applicationId = "com.fayed.routerctl"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "2.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file("keystore/release.jks")
+            storePassword = "routerctl2026"
+            keyAlias = "routerctl"
+            keyPassword = "routerctl2026"
+        }
     }
 
     buildTypes {
+        debug {
+            isMinifyEnabled = false
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
