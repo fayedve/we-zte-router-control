@@ -27,19 +27,14 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Create release keystore if missing
+      - name: Create release keystore
         run: |
+          mkdir -p keystore
           if [ ! -f keystore/release.jks ]; then
-            mkdir -p keystore
             keytool -genkeypair -v -keystore keystore/release.jks -alias routerctl \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass routerctl2026 -keypass routerctl2026 \
               -dname "CN=Router Control, OU=Personal, O=Personal, L=Cairo, C=EG"
-            git config user.name "github-actions"
-            git config user.email "github-actions@users.noreply.github.com"
-            git add keystore/release.jks
-            git commit -m "Add release signing keystore" || true
-            git push || echo "keystore push skipped"
           fi
 
       - name: Build release APK
@@ -54,7 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BODY=$(tail -c 15000 build.log | jq -Rs '{body: ("Build failed. Log tail:\n```\n" + . + "\n```")}')
+          BODY=$( (tail -c 15000 build.log 2>/dev/null || echo "No gradle log captured.") | jq -Rs '{body: ("Build failed. Log tail:\n```\n" + . + "\n```")}' )
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
