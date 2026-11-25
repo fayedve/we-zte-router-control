@@ -27,8 +27,27 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Create release keystore if missing
+        run: |
+          if [ ! -f keystore/release.jks ]; then
+            mkdir -p keystore
+            keytool -genkeypair -v -keystore keystore/release.jks -alias routerctl \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass routerctl2026 -keypass routerctl2026 \
+              -dname "CN=Router Control, OU=Personal, O=Personal, L=Cairo, C=EG"
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add keystore/release.jks
+            git commit -m "Add release signing keystore" || true
+            git push || echo "keystore push skipped"
+          fi
+
+      - name: Build release APK
+        run: gradle assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+        if: success()
+        run: gradle assembleDebug --no-daemon 2>&1 | tee -a build.log
 
       - name: Report build failure
         if: failure()
@@ -42,12 +61,14 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/issues/1/comments" \
             -d "$BODY"
 
-      - name: Publish APK release
+      - name: Publish APKs release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          body: Debug APK built from this commit.
-          files: app/build/outputs/apk/debug/app-debug.apk
+          body: Signed release APK plus debug APK, built from this commit.
+          files: |
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/debug/app-debug.apk
           fail_on_unmatched_files: true
