@@ -8,9 +8,13 @@ import android.content.Context
 import android.net.Uri
 import android.net.http.SslError
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.JsResult
 import android.webkit.SslErrorHandler
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -29,6 +33,8 @@ class MainActivity : Activity() {
 
     data class Item(val name: String, val mac: String, val ip: String)
 
+    data class Rule(val name: String, val ssid: String, val mac: String)
+
     private lateinit var addressInput: EditText
     private lateinit var web: WebView
     private lateinit var statusView: TextView
@@ -36,7 +42,17 @@ class MainActivity : Activity() {
 
     private val devices = ArrayList<Item>()
     private val rows = ArrayList<String>()
-    private var filterUrl: String? = null
+    private val rules = ArrayList<Rule>()
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var hasAccessControl = false
+    private var ssid1Mode = ""
+    private var pendingRead = ""
+    private var pendingAction = ""
+    private var pendingMac = ""
+    private var pendingName = ""
+    private var gotoFollow = "block"
+    private var gotoAttempted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -77,14 +93,14 @@ class MainActivity : Activity() {
         web.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         web.addJavascriptInterface(Bridge(), "Android")
         web.webViewClient = object : WebViewClient() {
-            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                if (handler == null) {
+            override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
+                if (sslHandler == null) {
                     return
                 }
                 if (isPrivateHost(error?.url?.let { Uri.parse(it).host })) {
-                    handler.proceed()
+                    sslHandler.proceed()
                 } else {
-                    handler.cancel()
+                    sslHandler.cancel()
                 }
             }
 
@@ -96,6 +112,20 @@ class MainActivity : Activity() {
                 view?.evaluateJavascript(EXTRACT_JS, null)
             }
         }
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                if (message != null) {
+                    statusView.text = message
+                }
+                result?.confirm()
+                return true
+            }
+
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                result?.confirm()
+                return true
+            }
+        }
         root.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3f))
 
         val buttonRow = LinearLayout(this)
@@ -104,6 +134,13 @@ class MainActivity : Activity() {
         refresh.text = "تحديث الأجهزة"
         refresh.setOnClickListener { runExtract() }
         buttonRow.addView(refresh, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val rulesButton = Button(this)
+        rulesButton.text = "قواعد الحظر"
+        rulesButton.setOnClickListener {
+            statusView.text = "بقرأ قواعد الحظر من صفحة الراوتر..."
+            readRules("list")
+        }
+        buttonRow.addView(rulesButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val diag = Button(this)
         diag.text = "تشخيص"
         diag.setOnClickListener { runProbe() }
@@ -143,8 +180,32 @@ class MainActivity : Activity() {
     }
 
     private fun runProbe() {
-        statusView.text = "جاري فحص صفحات فلترة MAC على الراوتر..."
+        statusView.text = "جاري فحص مسارات صفحة الحظر على الراوتر..."
         web.evaluateJavascript(PROBE_JS, null)
+    }
+
+    private fun evaluateAsset(name: String) {
+        try {
+            val js = assets.open(name).bufferedReader().use { it.readText() }
+            web.evaluateJavascript(js, null)
+        } catch (e: Exception) {
+            statusView.text = "تعذر تحميل " + name + ": " + e.message
+        }
+    }
+
+    private fun evaluateAsset(name: String, mac: String, label: String) {
+        try {
+            val raw = assets.open(name).bufferedReader().use { it.readText() }
+            val js = raw.replace("__MAC__", mac).replace("__NAME__", label)
+            web.evaluateJavascript(js, null)
+        } catch (e: Exception) {
+            statusView.text = "تعذر تحميل " + name + ": " + e.message
+        }
+    }
+
+    private fun readRules(kind: String) {
+        pendingRead = kind
+        evaluateAsset("ac_read.js")
     }
 
     private fun renderDevices(json: String) {
@@ -179,12 +240,189 @@ class MainActivity : Activity() {
         adapter.notifyDataSetChanged()
     }
 
+    private fun handleRules(json: String) {
+        try {
+            val root = JSONObject(json)
+            hasAccessControl = root.optBoolean("hasAccessControl", false)
+            rules.clear()
+            val arr = root.optJSONArray("rules") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                rules.add(Rule(o.optString("name"), o.optString("ssid"), o.optString("mac")))
+            }
+            ssid1Mode = ""
+            val modes = root.optJSONArray("modes") ?: JSONArray()
+            for (i in 0 until modes.length()) {
+                val o = modes.getJSONObject(i)
+                if (o.optString("ssid").equals("SSID1", true)) {
+                    ssid1Mode = o.optString("mode")
+                }
+            }
+        } catch (e: Exception) {
+            statusView.text = "تعذر قراءة الصفحة: " + e.message
+            return
+        }
+        when (pendingRead) {
+            "list" -> showRulesDialog()
+            "block" -> continueBlock()
+            "verifyBlock" -> verifyBlock()
+            "verifyUnblock" -> verifyUnblock()
+        }
+    }
+
+    private fun continueBlock() {
+        if (!hasAccessControl) {
+            if (!gotoAttempted) {
+                gotoAttempted = true
+                gotoFollow = "block"
+                pendingAction = "goto"
+                statusView.text = "بحاول أفتح صفحة WLAN Advanced من منيو الراوتر..."
+                evaluateAsset("ac_goto.js")
+                return
+            }
+            statusView.text = "مش لاقي صفحة Access Control. افتح Local Network ← WLAN ← WLAN Advanced وبعدها اضغط على الجهاز تاني."
+            return
+        }
+        if (rules.any { it.mac.equals(pendingMac, true) }) {
+            statusView.text = "الـMAC ده موجود بالفعل في قواعد الحظر."
+            return
+        }
+        if (!ssid1Mode.contains("black", true)) {
+            pendingAction = "setmode"
+            statusView.text = "بضبط SSID1 على Black List..."
+            evaluateAsset("ac_setmode.js")
+            return
+        }
+        addRule()
+    }
+
+    private fun addRule() {
+        pendingAction = "add"
+        statusView.text = "بضيف قاعدة حظر على SSID1 للجهاز " + pendingName + "..."
+        evaluateAsset("ac_add.js", pendingMac, pendingName)
+    }
+
+    private fun handleActionResult(json: String) {
+        val o = try {
+            JSONObject(json)
+        } catch (e: Exception) {
+            JSONObject()
+        }
+        val ok = o.optBoolean("ok", false)
+        val error = o.optString("error")
+        when (pendingAction) {
+            "goto" -> {
+                if (ok) {
+                    statusView.text = "اتفتحت " + o.optString("label") + "، بستنى الصفحة..."
+                    handler.postDelayed({ readRules(gotoFollow) }, 4000)
+                } else {
+                    statusView.text = "مقدرتش ألاقي لينك WLAN Advanced. افتحها من قايمة Local Network وبعدها اضغط على الجهاز تاني."
+                }
+            }
+            "setmode" -> {
+                if (!ok) {
+                    statusView.text = "مقدرتش أضبط SSID1 على Black List من الصفحة دي (" + error + "). اضبطها يدويًا من Access Control-Mode Configuration."
+                    return
+                }
+                statusView.text = "SSID1 بقى Black List. بضيف القاعدة..."
+                handler.postDelayed({ addRule() }, 3000)
+            }
+            "add" -> {
+                if (!ok) {
+                    statusView.text = "مقدرتش أضيف القاعدة (" + error + "). أضفها يدويًا من WLAN Advanced ← Create New Item."
+                    return
+                }
+                statusView.text = "اتبعتت القاعدة للراوتر، بتأكد من القايمة..."
+                handler.postDelayed({ readRules("verifyBlock") }, 3000)
+            }
+            "delete" -> {
+                if (!ok) {
+                    statusView.text = "مقدرتش أحذف القاعدة (" + error + "hesitate). احذفها يدويًا من WLAN Advanced."
+                    return
+                }
+                statusView.text = "اتبعت الحذف، بتأكد من القايمة..."
+                handler.postDelayed({ readRules("verifyUnblock") }, 3000)
+            }
+        }
+    }
+
+    private fun verifyBlock() {
+        val rule = rules.firstOrNull { it.mac.equals(pendingMac, true) }
+        if (rule == null) {
+            statusView.text = "الراوتر استقبل الطلب بس القاعدة مش ظاهرة في القايمة. راجع «قواعد الحظر» أو أضفها يدويًا."
+            return
+        }
+        val onSsid1 = rule.ssid.isEmpty() || rule.ssid.equals("SSID1", true)
+        statusView.text = if (onSsid1) {
+            "تم وأكده الراوتر: القاعدة اتسجلت على SSID1. الجهاز هيفصل من الشبكة."
+        } else {
+            "القاعدة اتسجلت على " + rule.ssid + " مش SSID1، فمش هتحظر على الشبكة الشغالة. راجعها من «قواعد الحظر»."
+        }
+    }
+
+    private fun verifyUnblock() {
+        val still = rules.any { it.mac.equals(pendingMac, true) }
+        statusView.text = if (still) {
+            "القاعدة لسه موجودة بعد الحذف. جرّب تحذفها من صفحة الراوتر."
+        } else {
+            "تم وأكده الراوتر: القاعدة اتشالت من قايمة الحظر."
+        }
+    }
+
+    private fun showRulesDialog() {
+        if (!hasAccessControl) {
+            statusView.text = "الصفحة المفتوحة مش صفحة WLAN Advanced. افتح Local Network ← WLAN ← WLAN Advanced وبعدها اضغط «قواعد الحظر»."
+            return
+        }
+        if (rules.isEmpty()) {
+            statusView.text = "مفيش قواعد حظر مسجلة على الراوتر دلوقتي."
+            return
+        }
+        val labels = ArrayList<String>()
+        for (r in rules) {
+            val line = StringBuilder()
+            line.append(if (r.name.isEmpty()) "بدون اسم" else r.name)
+            if (r.ssid.isNotEmpty()) {
+                line.append("  ·  ").append(r.ssid)
+            }
+            line.append("\n").append(r.mac).append("  —  اضغط لفك الحظر")
+            labels.add(line.toString())
+        }
+        AlertDialog.Builder(this)
+            .setTitle("قواعد الحظر (" + rules.size + ")")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which >= 0 && which < rules.size) {
+                    confirmUnblock(rules[which])
+                }
+            }
+            .setNegativeButton("إغلاق", null)
+            .show()
+        statusView.text = "قواعد الحظر: " + rules.size + " — SSID1 على " + (if (ssid1Mode.isEmpty()) "حالة غير معروفة" else ssid1Mode)
+    }
+
+    private fun confirmUnblock(rule: Rule) {
+        val label = if (rule.name.isEmpty()) rule.mac else rule.name
+        AlertDialog.Builder(this)
+            .setTitle("فك الحظر")
+            .setMessage("أشيل القاعدة " + label + " (" + rule.mac + ") من " + (if (rule.ssid.isEmpty()) "قايمة الحظر" else rule.ssid) + "؟")
+            .setPositiveButton("اشيلها") { _, _ -> deleteRule(rule) }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun deleteRule(rule: Rule) {
+        pendingMac = rule.mac
+        pendingName = rule.name
+        pendingAction = "delete"
+        statusView.text = "بحذف القاعدة " + rule.mac + "..."
+        evaluateAsset("ac_delete.js", rule.mac, rule.name)
+    }
+
     private fun showProbe(json: String) {
         val report = StringBuilder()
         var detected: String? = null
         try {
             val root = JSONObject(json)
-
             val links = root.optJSONArray("links") ?: JSONArray()
             if (links.length() > 0) {
                 report.append("لينكات منيو الراوتر:\n")
@@ -200,7 +438,6 @@ class MainActivity : Activity() {
                 }
             }
             report.append("\n")
-
             val probes = root.optJSONArray("probes") ?: JSONArray()
             for (i in 0 until probes.length()) {
                 val probe = probes.getJSONObject(i)
@@ -226,7 +463,6 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             report.append("تعذر قراءة نتايج الفحص: ").append(e.message)
         }
-        filterUrl = detected
         val box = TextView(this)
         box.text = report.toString()
         box.textSize = 12f
@@ -237,18 +473,11 @@ class MainActivity : Activity() {
             .setView(scroll)
             .setPositiveButton("تمام", null)
             .show()
-        statusView.text = if (filterUrl == null) {
-            "مفيش مسار فلتر MAC متأكد منه على الفيرموير ده. أضف الجهاز من صفحة الحظر في الراوتر."
-        } else {
-            "مسار محتمل لصفحة الحظر: " + filterUrl
-        }
+        statusView.text = "التشخيص خلص. صفحة الحظر على الفيرموير ده هي WLAN Advanced تحت Local Network."
     }
 
     private fun showDeviceDialog(item: Item) {
-        val options = arrayOf(
-            "افتح صفحة الحظر في الراوتر (إضافة الجهاز يدويًا)",
-            "انسخ عنوان MAC"
-        )
+        val options = arrayOf("احظر الجهاز من الشبكة", "افتح صفحة الحظر في الراوتر", "انسخ عنوان MAC")
         val details = StringBuilder()
         details.append("MAC: ").append(item.mac)
         if (item.ip.isNotEmpty()) {
@@ -258,26 +487,39 @@ class MainActivity : Activity() {
             .setTitle(if (item.name.isEmpty()) item.mac else item.name)
             .setMessage(details.toString())
             .setItems(options) { _, which ->
-                if (which == 0) {
-                    startManualBlock(item)
-                } else {
-                    copyMac(item.mac)
-                    Toast.makeText(this, "اتنسخ عنوان MAC", Toast.LENGTH_SHORT).show()
+                when (which) {
+                    0 -> beginBlock(item)
+                    1 -> openFilterPage()
+                    else -> {
+                        copyMac(item.mac)
+                        Toast.makeText(this, "اتنسخ عنوان MAC", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
             .setNegativeButton("إلغاء", null)
             .show()
     }
 
-    private fun startManualBlock(item: Item) {
-        copyMac(item.mac)
-        web.loadUrl(filterUrl ?: absolute("/"))
-        val message = if (filterUrl != null) {
-            "اتنسخ عنوان MAC. أضفه في صفحة الحظر اللي اتفتحت."
-        } else {
-            "اتنسخ عنوان MAC. مسار فلترة MAC على الفيرموير ده مش متأكد منه، فأضف الجهاز من Local Network > WLAN > WLAN Advanced > Access Control أو من Security."
-        }
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    private fun beginBlock(item: Item) {
+        pendingMac = item.mac
+        pendingName = safeName(item.name, item.mac)
+        gotoAttempted = false
+        statusView.text = "بقرأ قواعد الحظر من صفحة الراوتر..."
+        readRules("block")
+    }
+
+    private fun openFilterPage() {
+        gotoFollow = "list"
+        gotoAttempted = true
+        pendingAction = "goto"
+        statusView.text = "بحاول أفتح صفحة WLAN Advanced..."
+        evaluateAsset("ac_goto.js")
+    }
+
+    private fun safeName(name: String, mac: String): String {
+        val cleaned = name.replace("\n", " ").replace("\"", "").replace("'", "").replace("\\", "").trim()
+        val picked = if (cleaned.isEmpty()) "blocked" else cleaned
+        return if (picked.length > 24) picked.substring(0, 24) else picked
     }
 
     private fun isFilterLink(href: String, label: String): Boolean {
@@ -340,6 +582,16 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun onProbe(json: String) {
             runOnUiThread { showProbe(json) }
+        }
+
+        @JavascriptInterface
+        fun onRules(json: String) {
+            runOnUiThread { handleRules(json) }
+        }
+
+        @JavascriptInterface
+        fun onActionResult(json: String) {
+            runOnUiThread { handleActionResult(json) }
         }
     }
 
