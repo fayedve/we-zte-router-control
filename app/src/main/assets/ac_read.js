@@ -8,8 +8,21 @@
       window.Android.onRules(JSON.stringify(o));
     }
   }
-  var out = { page: location.href, title: document.title, hasAccessControl: false, modes: [], rules: [] };
+  var out = { page: location.href, title: document.title, needsLogin: false, hasAccessControl: false, modes: [], rules: [] };
+  var docs = [document];
+  var f;
+  for (f = 0; f < window.frames.length; f++) {
+    try { docs.push(window.frames[f].document); } catch (e) { }
+  }
+  for (f = 0; f < docs.length; f++) {
+    var pw = docs[f].querySelector('input[type=password]');
+    if (pw) { out.needsLogin = true; }
+  }
   var body = document.body ? txt(document.body) : '';
+  for (f = 0; f < docs.length; f++) {
+    var b = docs[f].body ? txt(docs[f].body) : '';
+    if (b.length > body.length) { body = b; }
+  }
   out.hasAccessControl = /access\s*control/i.test(body) && /(black\s*list|white\s*list|no\s*filter)/i.test(body);
   var rows = document.querySelectorAll('tr');
   var i;
