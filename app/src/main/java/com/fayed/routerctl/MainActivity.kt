@@ -143,7 +143,7 @@ class MainActivity : Activity() {
     }
 
     private fun runProbe() {
-        statusView.text = "جاري فحص صفحات فلترة MAC..."
+        statusView.text = "جاري فحص صفحات فلترة MAC على الراوتر..."
         web.evaluateJavascript(PROBE_JS, null)
     }
 
@@ -183,15 +183,33 @@ class MainActivity : Activity() {
         val report = StringBuilder()
         var detected: String? = null
         try {
-            val arr = JSONObject(json).optJSONArray("probes") ?: JSONArray()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val path = obj.optString("url")
-                val status = obj.optInt("status", 0)
-                val pageTitle = obj.optString("title")
-                val hasMac = obj.optBoolean("macTable", false)
-                val hasFilter = obj.optBoolean("filterForm", false)
-                val error = obj.optString("error")
+            val root = JSONObject(json)
+
+            val links = root.optJSONArray("links") ?: JSONArray()
+            if (links.length() > 0) {
+                report.append("لينكات منيو الراوتر:\n")
+            }
+            for (i in 0 until links.length()) {
+                val link = links.getJSONObject(i)
+                val href = link.optString("href")
+                val label = link.optString("text")
+                report.append("  ").append(if (label.isEmpty()) href else label)
+                report.append(" -> ").append(href).append("\n")
+                if (detected == null && href.isNotEmpty() && isFilterLink(href, label)) {
+                    detected = absolute(href)
+                }
+            }
+            report.append("\n")
+
+            val probes = root.optJSONArray("probes") ?: JSONArray()
+            for (i in 0 until probes.length()) {
+                val probe = probes.getJSONObject(i)
+                val path = probe.optString("url")
+                val status = probe.optInt("status", 0)
+                val pageTitle = probe.optString("title")
+                val hasMac = probe.optBoolean("macTable", false)
+                val hasFilter = probe.optBoolean("filterForm", false)
+                val error = probe.optString("error")
                 report.append(path).append("\n")
                 if (status == 0) {
                     report.append("  الحالة: فشل (").append(error).append(")\n")
@@ -220,9 +238,9 @@ class MainActivity : Activity() {
             .setPositiveButton("تمام", null)
             .show()
         statusView.text = if (filterUrl == null) {
-            "مفيش مسار فلتر MAC متأكد منه. أضف الجهاز من صفحة الحظر في الراوتر."
+            "مفيش مسار فلتر MAC متأكد منه على الفيرموير ده. أضف الجهاز من صفحة الحظر في الراوتر."
         } else {
-            "مسار محتمل لفلتر MAC: " + filterUrl
+            "مسار محتمل لصفحة الحظر: " + filterUrl
         }
     }
 
@@ -255,11 +273,18 @@ class MainActivity : Activity() {
         copyMac(item.mac)
         web.loadUrl(filterUrl ?: absolute("/"))
         val message = if (filterUrl != null) {
-            "اتنسخ عنوان MAC. أضفه في صفحة فلتر MAC اللي اتفتحت."
+            "اتنسخ عنوان MAC. أضفه في صفحة الحظر اللي اتفتحت."
         } else {
-            "اتنسخ عنوان MAC. مسار فلترة MAC على الفيرموير ده مش متأكد منه، فأضف الجهاز من صفحة الحظر في الراوتر (Local Network أو Management & Diagnosis)."
+            "اتنسخ عنوان MAC. مسار فلترة MAC على الفيرموير ده مش متأكد منه، فأضف الجهاز من Local Network > WLAN > WLAN Advanced > Access Control أو من Security."
         }
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+    }
+
+    private fun isFilterLink(href: String, label: String): Boolean {
+        val value = (href + " " + label).lowercase()
+        val mentionsMac = value.contains("mac")
+        val mentionsFilter = value.contains("filter") || value.contains("access") || value.contains("control")
+        return mentionsMac && mentionsFilter
     }
 
     private fun copyMac(mac: String) {
@@ -346,8 +371,27 @@ class MainActivity : Activity() {
             "})();"
 
         private const val PROBE_JS = "(function () {\n" +
-            "var paths = ['/getpage.gch?pid=1002&nextpage=net_wlan_mac_filter_t.gch'," +
+            "var links = [];\n" +
+            "function collect(doc) {\n" +
+            "var anchors = doc.querySelectorAll('a');\n" +
+            "for (var a = 0; a < anchors.length; a++) {\n" +
+            "var href = anchors[a].getAttribute('href') || '';\n" +
+            "var text = (anchors[a].innerText || anchors[a].textContent || '').trim();\n" +
+            "if (href !== '' && (/(mac|filter|access|control|wlan)/i.test(href) || /(mac|filter|access|control|wlan)/i.test(text))) {\n" +
+            "links.push({ href: href, text: text.slice(0, 80) });\n" +
+            "}\n" +
+            "}\n" +
+            "}\n" +
+            "collect(document);\n" +
+            "for (var f = 0; f < window.frames.length; f++) {\n" +
+            "try { collect(window.frames[f].document); } catch (err) { }\n" +
+            "}\n" +
+            "var paths = ['/getpage.gch?pid=1002&nextpage=net_wlan_adv_t.gch'," +
+            "'/getpage.gch?pid=1002&nextpage=net_wlan_advanced_t.gch'," +
+            "'/getpage.gch?pid=1002&nextpage=net_wlan_mac_filter_t.gch'," +
             "'/getpage.gch?pid=1002&nextpage=net_wlan_macfilter_t.gch'," +
+            "'/getpage.gch?pid=1002&nextpage=net_wlan_access_control_t.gch'," +
+            "'/getpage.gch?pid=1002&nextpage=net_security_mac_filter_t.gch'," +
             "'/getpage.gch?pid=1002&nextpage=net_wlan_multi_ssid_t.gch'," +
             "'/getpage.gch?pid=1002&nextpage=net_wlan_basic_t.gch'," +
             "'/getpage.gch?pid=1002&nextpage=localnet_lan_t.gch'," +
@@ -355,7 +399,7 @@ class MainActivity : Activity() {
             "'/', '/cgi-bin/luci'];\n" +
             "var results = []; var index = 0;\n" +
             "function step() {\n" +
-            "if (index >= paths.length) { Android.onProbe(JSON.stringify({ probes: results })); return; }\n" +
+            "if (index >= paths.length) { Android.onProbe(JSON.stringify({ probes: results, links: links })); return; }\n" +
             "var p = paths[index]; index = index + 1;\n" +
             "fetch(p, { credentials: 'include' }).then(function (r) {\n" +
             "return r.text().then(function (t) {\n" +
@@ -363,7 +407,7 @@ class MainActivity : Activity() {
             "var m = t.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\n" +
             "if (m) { pageTitle = m[1].replace(/\\s+/g, ' ').trim(); }\n" +
             "var hasForm = /<form|<input/i.test(t);\n" +
-            "var macFilter = /mac[\\s_\\-]*filter/i.test(t);\n" +
+            "var macFilter = /mac[\\s_\\-]*filter/i.test(t) || /access[\\s_\\-]*control/i.test(t);\n" +
             "results.push({ url: p, status: r.status, title: pageTitle,\n" +
             "macTable: /([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/.test(t),\n" +
             "filterForm: hasForm && macFilter, error: '' });\n" +
