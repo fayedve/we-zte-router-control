@@ -1,54 +1,55 @@
 (function () {
-  function txt(el) {
-    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  var SSIDNO = __SSID__;
+  var WANT = "__MODE__";
+  function send(o) { try { RouterBridge.onResult(JSON.stringify(o)); } catch (e) { } }
+  function txt(el) { return ((el.innerText || el.textContent || el.value || "") + "").replace(/\s+/g, " ").trim(); }
+  function rowsWithRadios(d) {
+    var res = [];
+    var rows = d.querySelectorAll("tr");
+    for (var i = 0; i < rows.length; i++) { if (rows[i].querySelectorAll("input[type=radio]").length) { res.push(rows[i]); } }
+    return res;
   }
-  function report(o) {
-    if (window.Android && window.Android.onActionResult) {
-      window.Android.onActionResult(JSON.stringify(o));
-    }
-  }
-  function clickApply() {
-    var els = document.querySelectorAll('input[type=button], input[type=submit], button, a');
+  function clickApply(d) {
+    var els = d.querySelectorAll("input[type=button], input[type=submit], button");
     for (var i = els.length - 1; i >= 0; i--) {
-      var t = (txt(els[i]) || els[i].value || '').trim();
-      if (/^apply$/i.test(t)) { els[i].click(); return true; }
+      if (/^apply$/i.test(txt(els[i]))) { try { els[i].click(); return true; } catch (e) { } }
     }
     return false;
   }
-  var rows = document.querySelectorAll('tr');
-  var found = false;
-  var changed = false;
-  var mode = '';
-  for (var i = 0; i < rows.length; i++) {
-    var row = rows[i];
-    if (!/SSID\s*1\b/i.test(txt(row))) { continue; }
-    var radios = row.querySelectorAll('input[type=radio]');
-    if (!radios.length) { continue; }
-    found = true;
-    var cells = row.querySelectorAll('td, th');
-    for (var c = 0; c < cells.length; c++) {
-      var radio = cells[c].querySelector('input[type=radio]');
-      if (!radio) { continue; }
-      if (!/black\s*list/i.test(txt(cells[c]))) { continue; }
-      if (!radio.checked) { radio.click(); changed = true; }
-      mode = 'Black List';
-      break;
-    }
-    if (!mode) {
-      for (var k = 0; k < radios.length; k++) {
-        if (!/black\s*list/i.test(txt(radios[k].parentNode))) { continue; }
-        if (!radios[k].checked) { radios[k].click(); changed = true; }
-        mode = 'Black List';
+  try {
+    var docs = [document];
+    var i;
+    for (i = 0; i < window.frames.length; i++) { try { docs.push(window.frames[i].document); } catch (e) { } }
+    for (i = 0; i < docs.length; i++) {
+      var d = docs[i];
+      if (!d || !d.querySelector) { continue; }
+      var rows = rowsWithRadios(d);
+      if (!rows.length) { continue; }
+      var row = null;
+      for (var r = 0; r < rows.length; r++) {
+        var lab = txt(rows[r]).match(/SSID\s*(\d+)/i);
+        if (lab && parseInt(lab[1], 10) === SSIDNO) { row = rows[r]; break; }
+      }
+      if (!row && SSIDNO - 1 < rows.length) { row = rows[SSIDNO - 1]; }
+      if (!row) { continue; }
+      var want = WANT.toLowerCase();
+      var cells = row.querySelectorAll("td, th");
+      var clicked = false;
+      for (var c = 0; c < cells.length; c++) {
+        var radio = cells[c].querySelector("input[type=radio]");
+        if (!radio) { continue; }
+        var label = txt(cells[c]).toLowerCase();
+        if (label.indexOf(want) < 0) { label = txt(radio.parentNode).toLowerCase(); }
+        if (label.indexOf(want) < 0) { continue; }
+        if (!radio.checked) { try { radio.click(); } catch (e) { } }
+        clicked = true;
         break;
       }
+      if (!clicked) { send({ op: "setmode", ok: false, clicked: false, applied: false, ssid: SSIDNO, error: "mode-option-not-found" }); return; }
+      var applied = clickApply(d);
+      send({ op: "setmode", ok: applied, clicked: clicked, applied: applied, ssid: SSIDNO, mode: WANT, error: applied ? "" : "apply-not-found" });
+      return;
     }
-    break;
-  }
-  var applied = false;
-  if (changed) { applied = clickApply(); }
-  var error = '';
-  if (!found) { error = 'ssid1-row-not-found'; }
-  else if (!mode) { error = 'black-list-option-not-found'; }
-  else if (changed && !applied) { error = 'apply-not-found'; }
-  report({ ok: found && mode !== '' && (!changed || applied), changed: changed, applied: applied, mode: mode, error: error });
+    send({ op: "setmode", ok: false, clicked: false, applied: false, ssid: SSIDNO, error: "ssid-row-not-found" });
+  } catch (e) { send({ op: "setmode", ok: false, error: String(e) }); }
 })();
