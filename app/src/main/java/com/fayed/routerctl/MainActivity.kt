@@ -10,16 +10,22 @@ import android.net.http.SslError
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.JsResult
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -28,6 +34,11 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : Activity() {
 
@@ -36,6 +47,9 @@ class MainActivity : Activity() {
     data class Rule(val name: String, val ssid: String, val mac: String)
 
     private lateinit var addressInput: EditText
+    private lateinit var userInput: EditText
+    private lateinit var passInput: EditText
+    private lateinit var autoLoginBox: CheckBox
     private lateinit var web: WebView
     private lateinit var statusView: TextView
     private lateinit var adapter: ArrayAdapter<String>
@@ -45,6 +59,7 @@ class MainActivity : Activity() {
     private val rules = ArrayList<Rule>()
     private val handler = Handler(Looper.getMainLooper())
 
+    private var needsLogin = false
     private var hasAccessControl = false
     private var ssid1Mode = ""
     private var pendingRead = ""
@@ -53,10 +68,20 @@ class MainActivity : Activity() {
     private var pendingName = ""
     private var gotoFollow = "block"
     private var gotoAttempted = false
+    private var loginTried = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            buildUi()
+        } catch (e: Exception) {
+            val fallback = TextView(this)
+            fallback.text = "حصل خطأ في تجهيز الشاشة: " + e.message
+            setContentView(fallback)
+        }
+    }
 
+    private fun buildUi() {
         val pad = (12 * resources.displayMetrics.density).toInt()
 
         val root = LinearLayout(this)
@@ -81,9 +106,35 @@ class MainActivity : Activity() {
         urlRow.addView(openButton)
         root.addView(urlRow)
 
+        val credsRow = LinearLayout(this)
+        credsRow.orientation = LinearLayout.HORIZONTAL
+        userInput = EditText(this)
+        userInput.setSingleLine(true)
+        userInput.hint = "اسم المستخدم"
+        userInput.setText(prefs().getString(KEY_USER, "admin"))
+        credsRow.addView(userInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        passInput = EditText(this)
+        passInput.setSingleLine(true)
+        passInput.hint = "باسورد الراوتر"
+        passInput.inputType = 129
+        credsRow.addView(passInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val saveButton = Button(this)
+        saveButton.text = "حفظ"
+        saveButton.setOnClickListener { saveCredentials() }
+        credsRow.addView(saveButton)
+        root.addView(credsRow)
+
+        autoLoginBox = CheckBox(this)
+        autoLoginBox.text = "دخول تلقائي بالباسورد المحفوظ"
+        autoLoginBox.isChecked = prefs().getBoolean(KEY_AUTO, true)
+        autoLoginBox.setOnCheckedChangeListener { _, isChecked ->
+            prefs().edit().putBoolean(KEY_AUTO, isChecked).apply()
+        }
+        root.addView(autoLoginBox)
+
         statusView = TextView(this)
         statusView.textSize = 13f
-        statusView.text = "افتح صفحة الراوتر وسجّل الدخول، وبعدها اضغط تحديث الأجهزة."
+        statusView.text = "اكتب بيانات الدخول واحفظها، وبعدها اضغط فتح. الباسورد بيتخزن مشفّر على الموبايل بس."
         root.addView(statusView)
 
         web = WebView(this)
@@ -94,35 +145,70 @@ class MainActivity : Activity() {
         web.addJavascriptInterface(Bridge(), "Android")
         web.webViewClient = object : WebViewClient() {
             override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
-                if (sslHandler == null) {
-                    return
+                try {
+                    if (sslHandler == null) {
+                        return
+                    }
+                    if (isPrivateHost(error?.url?.let { Uri.parse(it).host })) {
+                        sslHandler.proceed()
+                    } else {
+                        sslHandler.cancel()
+                    }
+                } catch (e: Exception) {
+                    statusView.text = "مشكلة في شهادة أمان الراوتر: " + e.message
                 }
-                if (isPrivateHost(error?.url?.let { Uri.parse(it).host })) {
-                    sslHandler.proceed()
-                } else {
-                    sslHandler.cancel()
-                }
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                loginTried = false
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                if (url != null) {
-                    statusView.text = "الصفحة: " + url
+                try {
+                    if (url != null) {
+                        statusView.text = "الصفحة: " + url
+                    }
+                    view?.evaluateJavascript(EXTRACT_JS, null)
+                } catch (e: Exception) {
+                    statusView.text = "تعذر قراءة الصفحة: " + e.message
                 }
-                view?.evaluateJavascript(EXTRACT_JS, null)
+                maybeAutoLogin()
+            }
+
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                super.onReceivedError(view, request, error)
+                if (request != null && request.isForMainFrame) {
+                    statusView.text = "مش قادر أوصل لصفحة الراوتر. اتأكد إنك متصل بواي فاي الراوتر وإن العنوان صح، وبعدها اضغط فتح تاني."
+                }
+            }
+
+            override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: android.webkit.WebResourceResponse?) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                if (request != null && request.isForMainFrame) {
+                    statusView.text = "الراوتر رد بخطأ " + (errorResponse?.statusCode ?: 0) + ". جرّب تحديث الصفحة أو سجّل الدخول تاني."
+                }
             }
         }
         web.webChromeClient = object : WebChromeClient() {
             override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
-                if (message != null) {
-                    statusView.text = message
+                try {
+                    if (message != null) {
+                        statusView.text = message
+                    }
+                    result?.confirm()
+                } catch (e: Exception) {
+                    result?.confirm()
                 }
-                result?.confirm()
                 return true
             }
 
             override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
-                result?.confirm()
+                try {
+                    result?.confirm()
+                } catch (e: Exception) {
+                }
                 return true
             }
         }
@@ -151,8 +237,12 @@ class MainActivity : Activity() {
         val listView = ListView(this)
         listView.adapter = adapter
         listView.setOnItemClickListener { _, _, position, _ ->
-            if (position >= 0 && position < devices.size) {
-                showDeviceDialog(devices[position])
+            try {
+                if (position >= 0 && position < devices.size) {
+                    showDeviceDialog(devices[position])
+                }
+            } catch (e: Exception) {
+                statusView.text = "تعذر فتح الجهاز: " + e.message
             }
         }
         root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2f))
@@ -163,25 +253,49 @@ class MainActivity : Activity() {
     private fun prefs() = getSharedPreferences("router_ctl", Context.MODE_PRIVATE)
 
     private fun openRouter() {
-        val raw = addressInput.text.toString().trim()
-        val url = when {
-            raw.isEmpty() -> DEFAULT_URL
-            raw.startsWith("http") -> raw
-            else -> "https://" + raw
+        try {
+            val raw = addressInput.text.toString().trim()
+            val url = when {
+                raw.isEmpty() -> DEFAULT_URL
+                raw.startsWith("http") -> raw
+                else -> "https://" + raw
+            }
+            prefs().edit().putString(KEY_ADDRESS, url).apply()
+            statusView.text = "جاري فتح " + url
+            web.loadUrl(url)
+        } catch (e: Exception) {
+            statusView.text = "تعذر فتح الصفحة: " + e.message
         }
-        prefs().edit().putString(KEY_ADDRESS, url).apply()
-        statusView.text = "جاري فتح " + url
-        web.loadUrl(url)
     }
 
     private fun runExtract() {
-        statusView.text = "جاري قراءة الأجهزة من الصفحة المفتوحة..."
-        web.evaluateJavascript(EXTRACT_JS, null)
+        try {
+            statusView.text = "جاري قراءة الأجهزة من الصفحة المفتوحة..."
+            web.evaluateJavascript(EXTRACT_JS, null)
+            scheduleWatch("extract", "الصفحة ما ردّتش على تحديث الأجهزة. اضغط تحديث تاني أو أعد فتح الصفحة.")
+        } catch (e: Exception) {
+            statusView.text = "تعذر تحديث الأجهزة: " + e.message
+        }
     }
 
     private fun runProbe() {
-        statusView.text = "جاري فحص مسارات صفحة الحظر على الراوتر..."
-        web.evaluateJavascript(PROBE_JS, null)
+        try {
+            statusView.text = "جاري فحص مسارات صفحة الحظر على الراوتر..."
+            web.evaluateJavascript(PROBE_JS, null)
+            scheduleWatch("probe", "الفحص ما رجعش نتيجة. جرّب تضغط تشخيص تاني بعد ما تتأكد إنك داخل الراوتر.")
+        } catch (e: Exception) {
+            statusView.text = "تعذر بدء الفحص: " + e.message
+        }
+    }
+
+    private fun scheduleWatch(kind: String, message: String) {
+        handler.postDelayed({
+            if (pendingRead == kind || pendingAction == kind) {
+                pendingRead = ""
+                pendingAction = ""
+                statusView.text = message
+            }
+        }, 10000)
     }
 
     private fun evaluateAsset(name: String) {
@@ -196,23 +310,152 @@ class MainActivity : Activity() {
     private fun evaluateAsset(name: String, mac: String, label: String) {
         try {
             val raw = assets.open(name).bufferedReader().use { it.readText() }
-            val js = raw.replace("__MAC__", mac).replace("__NAME__", label)
+            val js = raw.replace("__MAC__", jsEscape(mac)).replace("__NAME__", jsEscape(label))
             web.evaluateJavascript(js, null)
         } catch (e: Exception) {
             statusView.text = "تعذر تحميل " + name + ": " + e.message
         }
     }
 
+    private fun jsEscape(value: String): String {
+        val sb = StringBuilder()
+        for (ch in value) {
+            when (ch) {
+                '\\' -> sb.append("\\\\")
+                '"' -> sb.append("\\\"")
+                '\'' -> sb.append("\\'")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("")
+                '<' -> sb.append("\\u003c")
+                '>' -> sb.append("\\u003e")
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun saveCredentials() {
+        try {
+            val user = userInput.text.toString().trim()
+            val pass = passInput.text.toString()
+            if (pass.isEmpty()) {
+                statusView.text = "اكتب باسورد الراوتر الأول."
+                return
+            }
+            prefs().edit()
+                .putString(KEY_USER, if (user.isEmpty()) "admin" else user)
+                .putBoolean(KEY_AUTO, autoLoginBox.isChecked)
+                .apply()
+            if (writeSecret(pass)) {
+                passInput.setText("")
+                statusView.text = "اتحفظت بيانات الدخول على الموبايل بس، مشفّرة."
+            } else {
+                statusView.text = "تعذر تشفير الباسورد وحفظه على الجهاز ده."
+            }
+        } catch (e: Exception) {
+            statusView.text = "تعذر حفظ بيانات الدخول: " + e.message
+        }
+    }
+
+    private fun secretKey(): SecretKey? {
+        return try {
+            val ks = KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            val entry = ks.getEntry(KEY_ALIAS, null)
+            if (entry is KeyStore.SecretKeyEntry) {
+                entry.secretKey
+            } else {
+                val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                val spec = KeyGenParameterSpec.Builder(
+                    KEY_ALIAS,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .build()
+                gen.init(spec)
+                gen.generateKey()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun writeSecret(value: String): Boolean {
+        return try {
+            val key = secretKey() ?: return false
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val data = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+            val iv = Base64.encodeToString(cipher.iv, Base64.NO_WRAP)
+            val body = Base64.encodeToString(data, Base64.NO_WRAP)
+            prefs().edit().putString(KEY_SECRET, iv + ":" + body).apply()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun readSecret(): String? {
+        return try {
+            val stored = prefs().getString(KEY_SECRET, null) ?: return null
+            val parts = stored.split(":")
+            if (parts.size != 2) {
+                return null
+            }
+            val key = secretKey() ?: return null
+            val iv = Base64.decode(parts[0], Base64.NO_WRAP)
+            val data = Base64.decode(parts[1], Base64.NO_WRAP)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            String(cipher.doFinal(data), Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun maybeAutoLogin() {
+        try {
+            if (!autoLoginBox.isChecked || loginTried) {
+                return
+            }
+            loginTried = true
+            handler.postDelayed({ injectLogin() }, 1500)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun injectLogin() {
+        try {
+            val user = prefs().getString(KEY_USER, "admin") ?: "admin"
+            val pass = readSecret()
+            if (pass == null) {
+                statusView.text = "مفيش باسورد محفوظ. اكتبه في خانة الباسورد واضغط حفظ."
+                return
+            }
+            val raw = assets.open("ac_login.js").bufferedReader().use { it.readText() }
+            val js = raw.replace("__USER__", jsEscape(user)).replace("__PASS__", jsEscape(pass))
+            web.evaluateJavascript(js, null)
+        } catch (e: Exception) {
+            statusView.text = "تعذر الدخول التلقائي: " + e.message
+        }
+    }
+
     private fun readRules(kind: String) {
-        pendingRead = kind
-        evaluateAsset("ac_read.js")
+        try {
+            pendingRead = kind
+            evaluateAsset("ac_read.js")
+            scheduleWatch(kind, "الصفحة ما ردّتش. جرّب تحدّث الصفحة، ولو ظهرت شاشة دخول سجّل الدخول من جديد.")
+        } catch (e: Exception) {
+            statusView.text = "تعذر قراءة القواعد: " + e.message
+        }
     }
 
     private fun renderDevices(json: String) {
-        devices.clear()
-        rows.clear()
-        var message: String
         try {
+            devices.clear()
+            rows.clear()
+            var message: String
             val arr = JSONObject(json).optJSONArray("devices") ?: JSONArray()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
@@ -233,16 +476,19 @@ class MainActivity : Activity() {
             } else {
                 "عدد الأجهزة: " + devices.size + " — اضغط على أي جهاز للتحكم."
             }
+            statusView.text = message
+            adapter.notifyDataSetChanged()
         } catch (e: Exception) {
-            message = "تعذر قراءة قائمة الأجهزة: " + e.message
+            statusView.text = "تعذر عرض قائمة الأجهزة: " + e.message
         }
-        statusView.text = message
-        adapter.notifyDataSetChanged()
     }
 
     private fun handleRules(json: String) {
+        val kind = pendingRead
+        pendingRead = ""
         try {
             val root = JSONObject(json)
+            needsLogin = root.optBoolean("needsLogin", false)
             hasAccessControl = root.optBoolean("hasAccessControl", false)
             rules.clear()
             val arr = root.optJSONArray("rules") ?: JSONArray()
@@ -262,7 +508,11 @@ class MainActivity : Activity() {
             statusView.text = "تعذر قراءة الصفحة: " + e.message
             return
         }
-        when (pendingRead) {
+        if (needsLogin) {
+            statusView.text = "الراوتر رجّعك لشاشة الدخول. سجّل الدخول (أو فعّل الدخول التلقائي واضغط فتح)، وبعدها جرّب تاني."
+            return
+        }
+        when (kind) {
             "list" -> showRulesDialog()
             "block" -> continueBlock()
             "verifyBlock" -> verifyBlock()
@@ -278,6 +528,7 @@ class MainActivity : Activity() {
                 pendingAction = "goto"
                 statusView.text = "بحاول أفتح صفحة WLAN Advanced من منيو الراوتر..."
                 evaluateAsset("ac_goto.js")
+                scheduleWatch("goto", "مقدرتش أفتح صفحة الحظر لوحدي. افتحها من Local Network ← WLAN ← WLAN Advanced وبعدها اضغط على الجهاز تاني.")
                 return
             }
             statusView.text = "مش لاقي صفحة Access Control. افتح Local Network ← WLAN ← WLAN Advanced وبعدها اضغط على الجهاز تاني."
@@ -291,6 +542,7 @@ class MainActivity : Activity() {
             pendingAction = "setmode"
             statusView.text = "بضبط SSID1 على Black List..."
             evaluateAsset("ac_setmode.js")
+            scheduleWatch("setmode", "مقدرتش أضبط SSID1 على Black List. اضبطها يدويًا من Access Control-Mode Configuration.")
             return
         }
         addRule()
@@ -300,9 +552,12 @@ class MainActivity : Activity() {
         pendingAction = "add"
         statusView.text = "بضيف قاعدة حظر على SSID1 للجهاز " + pendingName + "..."
         evaluateAsset("ac_add.js", pendingMac, pendingName)
+        scheduleWatch("add", "الصفحة ما ردّتش على إضافة القاعدة. أضفها يدويًا من Create New Item.")
     }
 
     private fun handleActionResult(json: String) {
+        val action = pendingAction
+        pendingAction = ""
         val o = try {
             JSONObject(json)
         } catch (e: Exception) {
@@ -310,7 +565,7 @@ class MainActivity : Activity() {
         }
         val ok = o.optBoolean("ok", false)
         val error = o.optString("error")
-        when (pendingAction) {
+        when (action) {
             "goto" -> {
                 if (ok) {
                     statusView.text = "اتفتحت " + o.optString("label") + "، بستنى الصفحة..."
@@ -321,7 +576,7 @@ class MainActivity : Activity() {
             }
             "setmode" -> {
                 if (!ok) {
-                    statusView.text = "مقدرتش أضبط SSID1 على Black List من الصفحة دي (" + error + "). اضبطها يدويًا من Access Control-Mode Configuration."
+                    statusView.text = "مقدرتش أضبط SSID1 على Black List من الصفحة دي: " + error
                     return
                 }
                 statusView.text = "SSID1 بقى Black List. بضيف القاعدة..."
@@ -329,7 +584,7 @@ class MainActivity : Activity() {
             }
             "add" -> {
                 if (!ok) {
-                    statusView.text = "مقدرتش أضيف القاعدة (" + error + "). أضفها يدويًا من WLAN Advanced ← Create New Item."
+                    statusView.text = "مقدرتش أضيف القاعدة من الصفحة دي: " + error
                     return
                 }
                 statusView.text = "اتبعتت القاعدة للراوتر، بتأكد من القايمة..."
@@ -337,7 +592,7 @@ class MainActivity : Activity() {
             }
             "delete" -> {
                 if (!ok) {
-                    statusView.text = "مقدرتش أحذف القاعدة (" + error + "hesitate). احذفها يدويًا من WLAN Advanced."
+                    statusView.text = "مقدرتش أحذف القاعدة من الصفحة دي: " + error
                     return
                 }
                 statusView.text = "اتبعت الحذف، بتأكد من القايمة..."
@@ -354,7 +609,7 @@ class MainActivity : Activity() {
         }
         val onSsid1 = rule.ssid.isEmpty() || rule.ssid.equals("SSID1", true)
         statusView.text = if (onSsid1) {
-            "تم وأكده الراوتر: القاعدة اتسجلت على SSID1. الجهاز هيفصل من الشبكة."
+            "تم وأكده الراوتر: القاعدة اتسجلت على SSID1 والقايمة فيها الـMAC. الجهاز هيفصل من الشبكة."
         } else {
             "القاعدة اتسجلت على " + rule.ssid + " مش SSID1، فمش هتحظر على الشبكة الشغالة. راجعها من «قواعد الحظر»."
         }
@@ -411,17 +666,21 @@ class MainActivity : Activity() {
     }
 
     private fun deleteRule(rule: Rule) {
-        pendingMac = rule.mac
-        pendingName = rule.name
-        pendingAction = "delete"
-        statusView.text = "بحذف القاعدة " + rule.mac + "..."
-        evaluateAsset("ac_delete.js", rule.mac, rule.name)
+        try {
+            pendingMac = rule.mac
+            pendingName = rule.name
+            pendingAction = "delete"
+            statusView.text = "بحذف القاعدة " + rule.mac + "..."
+            evaluateAsset("ac_delete.js", rule.mac, rule.name)
+            scheduleWatch("delete", "الصفحة ما ردّتش على الحذف. احذف القاعدة يدويًا من WLAN Advanced.")
+        } catch (e: Exception) {
+            statusView.text = "تعذر بدء الحذف: " + e.message
+        }
     }
 
     private fun showProbe(json: String) {
-        val report = StringBuilder()
-        var detected: String? = null
         try {
+            val report = StringBuilder()
             val root = JSONObject(json)
             val links = root.optJSONArray("links") ?: JSONArray()
             if (links.length() > 0) {
@@ -433,9 +692,6 @@ class MainActivity : Activity() {
                 val label = link.optString("text")
                 report.append("  ").append(if (label.isEmpty()) href else label)
                 report.append(" -> ").append(href).append("\n")
-                if (detected == null && href.isNotEmpty() && isFilterLink(href, label)) {
-                    detected = absolute(href)
-                }
             }
             report.append("\n")
             val probes = root.optJSONArray("probes") ?: JSONArray()
@@ -456,64 +712,74 @@ class MainActivity : Activity() {
                 report.append("  العنوان: ").append(if (pageTitle.isEmpty()) "-" else pageTitle).append("\n")
                 report.append("  جدول MAC: ").append(if (hasMac) "موجود" else "غير موجود")
                 report.append("  |  فلتر MAC: ").append(if (hasFilter) "موجود" else "غير موجود").append("\n\n")
-                if (detected == null && status == 200 && hasFilter) {
-                    detected = absolute(path)
-                }
             }
+            val box = TextView(this)
+            box.text = report.toString()
+            box.textSize = 12f
+            val scroll = ScrollView(this)
+            scroll.addView(box)
+            AlertDialog.Builder(this)
+                .setTitle("نتايج التشخيص")
+                .setView(scroll)
+                .setPositiveButton("تمام", null)
+                .show()
+            statusView.text = "التشخيص خلص. صفحة الحظر على الفيرموير ده هي WLAN Advanced تحت Local Network."
         } catch (e: Exception) {
-            report.append("تعذر قراءة نتايج الفحص: ").append(e.message)
+            statusView.text = "تعذر عرض نتايج التشخيص: " + e.message
         }
-        val box = TextView(this)
-        box.text = report.toString()
-        box.textSize = 12f
-        val scroll = ScrollView(this)
-        scroll.addView(box)
-        AlertDialog.Builder(this)
-            .setTitle("نتايج التشخيص")
-            .setView(scroll)
-            .setPositiveButton("تمام", null)
-            .show()
-        statusView.text = "التشخيص خلص. صفحة الحظر على الفيرموير ده هي WLAN Advanced تحت Local Network."
     }
 
     private fun showDeviceDialog(item: Item) {
-        val options = arrayOf("احظر الجهاز من الشبكة", "افتح صفحة الحظر في الراوتر", "انسخ عنوان MAC")
-        val details = StringBuilder()
-        details.append("MAC: ").append(item.mac)
-        if (item.ip.isNotEmpty()) {
-            details.append("\nIP: ").append(item.ip)
-        }
-        AlertDialog.Builder(this)
-            .setTitle(if (item.name.isEmpty()) item.mac else item.name)
-            .setMessage(details.toString())
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> beginBlock(item)
-                    1 -> openFilterPage()
-                    else -> {
-                        copyMac(item.mac)
-                        Toast.makeText(this, "اتنسخ عنوان MAC", Toast.LENGTH_SHORT).show()
+        try {
+            val options = arrayOf("احظر الجهاز من الشبكة", "افتح صفحة الحظر في الراوتر", "انسخ عنوان MAC")
+            val details = StringBuilder()
+            details.append("MAC: ").append(item.mac)
+            if (item.ip.isNotEmpty()) {
+                details.append("\nIP: ").append(item.ip)
+            }
+            AlertDialog.Builder(this)
+                .setTitle(if (item.name.isEmpty()) item.mac else item.name)
+                .setMessage(details.toString())
+                .setItems(options) { _, which ->
+                    when (which) {
+                        0 -> beginBlock(item)
+                        1 -> openFilterPage()
+                        else -> {
+                            copyMac(item.mac)
+                            Toast.makeText(this, "اتنسخ عنوان MAC", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
-            }
-            .setNegativeButton("إلغاء", null)
-            .show()
+                .setNegativeButton("إلغاء", null)
+                .show()
+        } catch (e: Exception) {
+            statusView.text = "تعذر فتح الجهاز: " + e.message
+        }
     }
 
     private fun beginBlock(item: Item) {
-        pendingMac = item.mac
-        pendingName = safeName(item.name, item.mac)
-        gotoAttempted = false
-        statusView.text = "بقرأ قواعد الحظر من صفحة الراوتر..."
-        readRules("block")
+        try {
+            pendingMac = item.mac
+            pendingName = safeName(item.name, item.mac)
+            gotoAttempted = false
+            statusView.text = "بقرأ قواعد الحظر من صفحة الراوتر..."
+            readRules("block")
+        } catch (e: Exception) {
+            statusView.text = "تعذر بدء الحظر: " + e.message
+        }
     }
 
     private fun openFilterPage() {
-        gotoFollow = "list"
-        gotoAttempted = true
-        pendingAction = "goto"
-        statusView.text = "بحاول أفتح صفحة WLAN Advanced..."
-        evaluateAsset("ac_goto.js")
+        try {
+            gotoFollow = "list"
+            gotoAttempted = true
+            pendingAction = "goto"
+            statusView.text = "بحاول أفتح صفحة WLAN Advanced..."
+            evaluateAsset("ac_goto.js")
+            scheduleWatch("goto", "مقدرتش أفتح الصفحة لوحدي. افتحها من Local Network ← WLAN ← WLAN Advanced.")
+        } catch (e: Exception) {
+            statusView.text = "تعذر فتح صفحة الحظر: " + e.message
+        }
     }
 
     private fun safeName(name: String, mac: String): String {
@@ -522,30 +788,13 @@ class MainActivity : Activity() {
         return if (picked.length > 24) picked.substring(0, 24) else picked
     }
 
-    private fun isFilterLink(href: String, label: String): Boolean {
-        val value = (href + " " + label).lowercase()
-        val mentionsMac = value.contains("mac")
-        val mentionsFilter = value.contains("filter") || value.contains("access") || value.contains("control")
-        return mentionsMac && mentionsFilter
-    }
-
     private fun copyMac(mac: String) {
-        val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        manager.setPrimaryClip(ClipData.newPlainText("MAC", mac))
-    }
-
-    private fun absolute(path: String): String {
-        if (path.startsWith("http")) {
-            return path
+        try {
+            val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            manager.setPrimaryClip(ClipData.newPlainText("MAC", mac))
+        } catch (e: Exception) {
+            statusView.text = "تعذر نسخ الـMAC: " + e.message
         }
-        val base = web.url ?: DEFAULT_URL
-        val root = if (base.startsWith("http")) {
-            val uri = Uri.parse(base)
-            uri.scheme + "://" + uri.authority
-        } else {
-            DEFAULT_URL
-        }
-        return root + path
     }
 
     private fun isPrivateHost(host: String?): Boolean {
@@ -576,28 +825,68 @@ class MainActivity : Activity() {
     private inner class Bridge {
         @JavascriptInterface
         fun onDevices(json: String) {
-            runOnUiThread { renderDevices(json) }
+            try {
+                runOnUiThread { renderDevices(json) }
+            } catch (e: Exception) {
+            }
         }
 
         @JavascriptInterface
         fun onProbe(json: String) {
-            runOnUiThread { showProbe(json) }
+            try {
+                runOnUiThread { showProbe(json) }
+            } catch (e: Exception) {
+            }
         }
 
         @JavascriptInterface
         fun onRules(json: String) {
-            runOnUiThread { handleRules(json) }
+            try {
+                runOnUiThread { handleRules(json) }
+            } catch (e: Exception) {
+            }
         }
 
         @JavascriptInterface
         fun onActionResult(json: String) {
-            runOnUiThread { handleActionResult(json) }
+            try {
+                runOnUiThread { handleActionResult(json) }
+            } catch (e: Exception) {
+            }
+        }
+
+        @JavascriptInterface
+        fun onLoginResult(json: String) {
+            try {
+                runOnUiThread { handleLoginResult(json) }
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun handleLoginResult(json: String) {
+        try {
+            val o = JSONObject(json)
+            if (o.optBoolean("ok", false)) {
+                statusView.text = "اتبعتت بيانات الدخول للراوتر. لو شاشة الدخول لسه ظاهرة يبقى الباسورد غلط — عدّله واضغط حفظ."
+                return
+            }
+            val error = o.optString("error")
+            if (error == "password-field-not-found") {
+                return
+            }
+            statusView.text = "لقيت خانة الباسورد بس مش لاقي زرار دخول. سجّل الدخول بإيدك مرة واحدة."
+        } catch (e: Exception) {
         }
     }
 
     companion object {
         private const val DEFAULT_URL = "https://192.168.1.1"
         private const val KEY_ADDRESS = "address"
+        private const val KEY_USER = "user"
+        private const val KEY_AUTO = "autologin"
+        private const val KEY_SECRET = "secret"
+        private const val KEY_ALIAS = "router_ctl_key"
 
         private const val EXTRACT_JS = "(function () {\n" +
             "var macRe = /^[0-9a-fA-F]{2}([:-][0-9a-fA-F]{1,2}){4,7}$/;\n" +
