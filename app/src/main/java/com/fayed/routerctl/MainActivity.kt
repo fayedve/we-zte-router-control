@@ -28,6 +28,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -183,24 +184,24 @@ class MainActivity : Activity() {
         content.setPadding(dp(10), dp(6), dp(10), dp(10))
 
         devicesTitle = sectionTitle("الأجهزة المتصلة")
-        content.addView(devicesTitle)
+        content.addView(devicesTitle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         devicesBox = LinearLayout(this)
         devicesBox.orientation = LinearLayout.VERTICAL
-        content.addView(devicesBox)
+        content.addView(devicesBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         modesTitle = sectionTitle("حالة الحظر لكل SSID")
-        content.addView(modesTitle)
+        content.addView(modesTitle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         modesBox = LinearLayout(this)
         modesBox.orientation = LinearLayout.VERTICAL
-        content.addView(modesBox)
+        content.addView(modesBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         rulesTitle = sectionTitle("قواعد الحظر")
-        content.addView(rulesTitle)
+        content.addView(rulesTitle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         rulesBox = LinearLayout(this)
         rulesBox.orientation = LinearLayout.VERTICAL
-        content.addView(rulesBox)
+        content.addView(rulesBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        scroll.addView(content, ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        scroll.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         webHolder = LinearLayout(this)
@@ -814,12 +815,14 @@ class MainActivity : Activity() {
             name.textSize = 18f
             name.setTextColor(Color.parseColor("#111111"))
             name.setTypeface(null, Typeface.BOLD)
+            name.setSingleLine(false)
             card.addView(name)
 
             val info = TextView(this)
             info.text = "MAC: " + d.mac + "\nIP: " + (if (d.ip.isNotEmpty()) d.ip else "غير معروف")
             info.textSize = 16f
             info.setTextColor(Color.parseColor("#333333"))
+            info.setSingleLine(false)
             info.setPadding(0, dp(2), 0, dp(6))
             card.addView(info)
 
@@ -929,6 +932,7 @@ class MainActivity : Activity() {
             t.text = (if (r.name.isNotEmpty()) r.name else "بدون اسم") + "\n" + r.ssid + "  |  " + r.mac
             t.textSize = 16f
             t.setTextColor(Color.parseColor("#111111"))
+            t.setSingleLine(false)
             card.addView(t)
             val b = Button(this)
             b.text = "امسح القاعدة (فك الحظر)"
